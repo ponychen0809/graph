@@ -182,18 +182,30 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(not e)
 
     def on_search_finished(self, best, valid, b_count, elapsed):
-        self.p_bar.setVisible(False); self.set_ui_enabled(True)
-        self.st_v.setText(f"合法分法: {valid:,}"); self.st_v.setStyleSheet(f"color: {'green' if valid > 0 else 'red'}; font-weight: bold;")
+        self.p_bar.setVisible(False)
+        self.set_ui_enabled(True)
+        self.st_v.setText(f"合法分法: {valid:,}")
+        self.st_v.setStyleSheet(f"color: {'green' if valid > 0 else 'red'}; font-weight: bold;")
         self.log_message(f"--- 搜尋結束 (耗時 {elapsed:.2f}s) ---")
+        
         if valid > 0 and best:
-            self.log_message(f"[結果] 發現 {valid:,} 合法解 | 同分最佳解 {b_count:,} 種")
+            # 取得 C++ 傳回來的分數資訊
+            score = best.get("final_score", 0.0)
+            m1 = best.get("m1", 0.0)
+            m2 = best.get("m2", 0.0)
+            m3 = best.get("m3", 0.0)
+            
+            # 在 Log 區塊印出詳細分數
+            self.log_message(f"[結果] 發現 {valid:,} 種合法解 | 同分最佳解 {b_count:,} 種")
+            self.log_message(f"[最佳評分] {score:.6f} (越低越好)")
+            self.log_message(f" ├ M1 (數量方差): {m1:.2f}")
+            self.log_message(f" ├ M2 (拓樸方差): {m2:.2f}")
+            self.log_message(f" └ M3 (最大直徑): {m3}")
+            
+            # 替最佳解的連線著色
             palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan]
-            # 將分組結果寫回 Link 物件
             for i, group in enumerate(best["assignment"]): 
-                link_obj = self.edges_data[i][2]
-                link_obj.group_id = group # 紀錄這條邊屬於哪個組
-                link_obj.setPen(QPen(palette[group % len(palette)], 3))
-                link_obj.setVisible(True)
+                self.edges_data[i][2].setPen(QPen(palette[group % len(palette)], 3))
 
     # --- NEW: Visibility Logic ---
     def hide_selected_group(self):
