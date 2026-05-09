@@ -34,7 +34,7 @@ class SearchWorker(QThread):
             return
 
         reduced_total = self.k ** (E_count - 1)
-        self.log_msg.emit(f"啟動 C++ 加速引擎... (需檢查 {reduced_total:,} 種組合)")
+        self.log_msg.emit(f"開始搜尋 (需檢查 {reduced_total:,} 種組合)")
         
         start_time = time.time()
         last_update_time = start_time

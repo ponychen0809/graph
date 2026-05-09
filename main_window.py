@@ -11,7 +11,7 @@ from graph_logic import SearchWorker
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Python Graph Editor - 最佳平衡容錯分析 (高效優化版)")
+        self.setWindowTitle("Python Graph Editor - 最佳平衡容錯分析")
         self.resize(1300, 850)
         self.nodes, self.edges_data, self.node_id_counter, self.worker = [], [], 0, None
         
@@ -70,7 +70,7 @@ class MainWindow(QMainWindow):
         # --- Scene & View ---
         self.scene = QGraphicsScene(); self.scene.setSceneRect(0, 0, 1000, 800)
         self.view = QGraphicsView(self.scene); self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
-        main_layout.addWidget(self.view, stretch=7)
+        main_layout.addWidget(self.view, stretch=5)
 
         # --- Log & Stats ---
         info_layout = QHBoxLayout()
@@ -101,8 +101,12 @@ class MainWindow(QMainWindow):
     def create_te(self, layout, title, stretch, mono=False):
         v = QVBoxLayout(); v.addWidget(QLabel(title))
         t = QTextEdit(); t.setReadOnly(True); t.setMinimumHeight(180)
-        if mono: t.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
-        v.addWidget(t); layout.addLayout(v, stretch); return t
+        if mono: t.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        else:
+            # System Log 使用的字型
+            t.setFont(QFont("Segoe UI", 10))
+        v.addWidget(t); layout.addLayout(v, stretch)
+        return t
 
     def log_message(self, msg):
         self.log_te.append(msg); self.log_te.verticalScrollBar().setValue(self.log_te.verticalScrollBar().maximum())
@@ -189,23 +193,53 @@ class MainWindow(QMainWindow):
         self.log_message(f"--- 搜尋結束 (耗時 {elapsed:.2f}s) ---")
         
         if valid > 0 and best:
-            # 取得 C++ 傳回來的分數資訊
+            # 【新增】將最佳分組結果存入變數，供隱藏/還原功能使用
+            self.current_assignment = best["assignment"]
             score = best.get("final_score", 0.0)
-            m1 = best.get("m1", 0.0)
-            m2 = best.get("m2", 0.0)
-            m3 = best.get("m3", 0.0)
-            
-            # 在 Log 區塊印出詳細分數
+            m1 = best.get("m1", 0.0) # 新增抓取 m1
+            m2 = best.get("m2", 0.0) # 新增抓取 m2
+            m3 = best.get("m3", 0.0) # 新增抓取 m3
+            # 1. 輸出基本評分
+            score = best.get("final_score", 0.0)
             self.log_message(f"[結果] 發現 {valid:,} 種合法解 | 同分最佳解 {b_count:,} 種")
-            self.log_message(f"[最佳評分] {score:.6f} (越低越好)")
-            self.log_message(f" ├ M1 (數量方差): {m1:.2f}")
-            self.log_message(f" ├ M2 (拓樸方差): {m2:.2f}")
-            self.log_message(f" └ M3 (最大直徑): {m3}")
+            self.log_message(f"[最佳評分] {score:.6f}")
+
+            self.log_message(f" ├ 指標 M1 (數量方差): {m1:.2f}")
+            self.log_message(f" ├ 指標 M2 (拓樸方差): {m2:.2f}")
+            self.log_message(f" ├ 指標 M3 (最大直徑): {m3}")
+            # 2. 輸出各組邊數 (M1 詳細資料)
+            group_counts = best.get("group_edge_counts", [])
+            counts_str = ", ".join([f"Group {i}: {c} 邊" for i, c in enumerate(group_counts)])
+            self.log_message(f" ├ M1 邊數分佈: {counts_str}")
             
-            # 替最佳解的連線著色
-            palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan]
+            # 3. 輸出每個節點在各組的連線數 (M2 詳細資料)
+            node_dist = best.get("node_group_distribution", [])
+            self.log_message(f" ├ M2 節點連線詳情 [G0, G1, ...]:")
+            for node_idx, dist in enumerate(node_dist):
+                node_id = self.nodes[node_idx].node_id
+                dist_str = ", ".join(map(str, dist))
+                print(dist)
+                self.log_message(f" │  └ Node {node_id}: [{dist_str}]")
+
+            # 4. 輸出斷線後的直徑與最遠兩點 (M3 詳細資料)
+            removal_details = best.get("group_removal_details", [])
+            self.log_message(f" └ M3 斷線容錯分析 (各組移除後):")
+            for i, detail in enumerate(removal_details):
+                # 因為 C++ 回傳的是 index，我們要對應回介面的 node_id
+                nA_id = self.nodes[detail['nodeA']].node_id if detail['nodeA'] != -1 else "?"
+                nB_id = self.nodes[detail['nodeB']].node_id if detail['nodeB'] != -1 else "?"
+                dist = detail['dist']
+                self.log_message(f"    └ 移除 Group {i}: 直徑 {dist} | 最遠路徑 ({nA_id} ↔ {nB_id})")
+            
+            # 5. 著色並標記 Group ID
+            palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, 
+                       Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan]
             for i, group in enumerate(best["assignment"]): 
-                self.edges_data[i][2].setPen(QPen(palette[group % len(palette)], 3))
+                link_item = self.edges_data[i][2]
+                link_item.setPen(QPen(palette[group % len(palette)], 3))
+                # 【新增】將分組 ID 貼在 Link 物件上，隱藏按鈕才找得到它
+                link_item.group_id = group
+                
 
     # --- NEW: Visibility Logic ---
     def hide_selected_group(self):
@@ -216,10 +250,10 @@ class MainWindow(QMainWindow):
                 link.setVisible(False)
                 count += 1
         
-        # if count > 0:
-        #     self.log_message(f"[UI] 已暫時隱藏第 {target+1} 組的邊 (共 {count} 條)")
-        # else:
-        #     self.log_message(f"[警告] 找不到第 {target+1} 組的分組資訊，請先執行搜尋。")
+        if count > 0:
+            self.log_message(f"[UI] 已暫時隱藏第 {target+1} 組的邊 (共 {count} 條)")
+        else:
+            self.log_message(f"[警告] 找不到第 {target+1} 組的分組資訊，請先執行搜尋。")
 
     def show_all_edges(self):
         for _, _, link in self.edges_data:
