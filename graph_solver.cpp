@@ -9,89 +9,93 @@
 #include <thread>
 #include <atomic>
 #include <numeric>
+#include <mutex>
+#include <utility> 
 
 namespace py = pybind11;
 
-// 儲存斷線後的直徑資訊
 struct DiameterInfo {
     int dist = 0;
     int nodeA = -1;
     int nodeB = -1;
 };
 
-// 擴展結果結構，包含詳細統計
 struct SearchResult {
     std::vector<int> best_assignment;
     int valid_count = 0;
     int best_count = 0;
     double m1 = 0, m2 = 0, m3 = 0, final_score = 0;
 
-    // --- 新增詳細統計欄位 ---
     std::vector<int> group_edge_counts;
     std::vector<std::vector<int>> node_group_distribution;
-    std::vector<DiameterInfo> group_removal_details;
+    std::vector<std::pair<int, DiameterInfo>> group_removal_details; 
 };
 
-struct ThreadLocalBounds {
-    double mi1 = std::numeric_limits<double>::max(), ma1 = std::numeric_limits<double>::lowest();
-    double mi2 = std::numeric_limits<double>::max(), ma2 = std::numeric_limits<double>::lowest();
-    double mi3 = std::numeric_limits<double>::max(), ma3 = std::numeric_limits<double>::lowest();
-    SearchResult result;
+struct GlobalState {
+    std::mutex mtx;
+    double mi1 = 1e30, ma1 = -1e30;
+    double mi2 = 1e30, ma2 = -1e30;
+    double mi3 = 1e30, ma3 = -1e30;
+    SearchResult best_result;
+    double best_score = 1e30;
+    bool has_best = false;
+    unsigned long long total_valid = 0;
 };
 
 struct BFSResult {
-    int dist;
-    int furthest_node;
-    int visited_count;
+    int dist; int furthest_node; int visited_count;
 };
 
 BFSResult get_furthest_info(int num_nodes, const std::vector<std::vector<int>>& adj, int start_node) {
     std::vector<int> dists(num_nodes, -1);
-    std::queue<int> q;
-    q.push(start_node);
+    std::queue<int> q; q.push(start_node);
     dists[start_node] = 0;
-    int visited = 1;
-    int max_d = 0;
-    int furthest = start_node;
+    int visited = 1; int max_d = 0; int furthest = start_node;
 
     while(!q.empty()) {
-        int u = q.front();
-        q.pop();
-        if (dists[u] > max_d) {
-            max_d = dists[u];
-            furthest = u;
-        }
+        int u = q.front(); q.pop();
+        if (dists[u] > max_d) { max_d = dists[u]; furthest = u; }
         for(int v : adj[u]) {
-            if(dists[v] == -1) {
-                dists[v] = dists[u] + 1;
-                visited++;
-                q.push(v);
-            }
+            if(dists[v] == -1) { dists[v] = dists[u] + 1; visited++; q.push(v); }
         }
     }
     return {max_d, furthest, visited};
 }
 
 inline double norm(double v, double mi, double ma) {
-    return (ma != mi) ? (v - mi) / (ma - mi) : 0.0;
+    return (ma > mi) ? (v - mi) / (ma - mi) : 0.0;
 }
 
 void idx_to_assignment(unsigned long long idx, int k, int E, std::vector<int>& assignment) {
     assignment[0] = 0;
-    for (int i = E - 1; i > 0; --i) {
-        assignment[i] = idx % k;
-        idx /= k;
-    }
+    for (int i = E - 1; i > 0; --i) { assignment[i] = idx % k; idx /= k; }
 }
 
 py::dict search_best_assignment(
     int k, int num_nodes, 
     std::vector<std::pair<int, int>> edges, 
     std::vector<double> weights,
-    std::function<bool(unsigned long long, unsigned long long, double)> progress_callback // 增加 double 參數用來回傳分數
+    int fault_tolerance, 
+    // 【修改】加入第 4 個參數 (unsigned long long) 用來傳遞合法解數量
+    std::function<bool(unsigned long long, unsigned long long, double, unsigned long long)> progress_callback
 ) {
     int E = edges.size();
     if (E == 0 || num_nodes == 0) return py::dict();
+
+    int target_mask = (1 << k) - 1;
+    std::vector<int> failure_masks;
+    for (int i = 1; i <= target_mask; ++i) {
+        int bits = 0;
+        for (int j = 0; j < k; ++j) {
+            if (i & (1 << j)) bits++;
+        }
+        if (bits == fault_tolerance) {
+            failure_masks.push_back(i); 
+        }
+    }
+    if (failure_masks.empty()) {
+        for (int i = 0; i < k; ++i) failure_masks.push_back(1 << i);
+    }
 
     unsigned long long total_combinations = std::pow(k, std::max(0, E - 1));
     unsigned int num_threads = std::thread::hardware_concurrency();
@@ -100,11 +104,11 @@ py::dict search_best_assignment(
     unsigned long long chunk_size = total_combinations / num_threads;
     std::atomic<unsigned long long> global_count(0);
     std::atomic<bool> global_stop_flag(false);
-    std::vector<ThreadLocalBounds> thread_results(num_threads);
+    
+    GlobalState global_state;
     std::vector<std::thread> threads;
 
     double W1 = weights[0], W2 = weights[1], W3 = weights[2];
-    int target_mask = (1 << k) - 1;
 
     py::gil_scoped_release release;
 
@@ -117,130 +121,170 @@ py::dict search_best_assignment(
             idx_to_assignment(start_idx, k, E, assignment);
             std::vector<std::vector<int>> adj(num_nodes);
             
-            ThreadLocalBounds& local = thread_results[t];
             unsigned long long local_loop_count = 0;
+            double local_mi1 = 1e30, local_ma1 = -1e30;
+            double local_mi2 = 1e30, local_ma2 = -1e30;
+            double local_mi3 = 1e30, local_ma3 = -1e30;
+            int local_batch_valid = 0;
+            
+            bool has_local_best = false;
+            SearchResult local_best;
+            
+            double cached_mi1 = 1e30, cached_ma1 = -1e30;
+            double cached_mi2 = 1e30, cached_ma2 = -1e30;
+            double cached_mi3 = 1e30, cached_ma3 = -1e30;
+
+            auto flush_local_state = [&]() {
+                std::lock_guard<std::mutex> lock(global_state.mtx);
+                if (local_batch_valid > 0) {
+                    global_state.mi1 = std::min(global_state.mi1, local_mi1);
+                    global_state.ma1 = std::max(global_state.ma1, local_ma1);
+                    global_state.mi2 = std::min(global_state.mi2, local_mi2);
+                    global_state.ma2 = std::max(global_state.ma2, local_ma2);
+                    global_state.mi3 = std::min(global_state.mi3, local_mi3);
+                    global_state.ma3 = std::max(global_state.ma3, local_ma3);
+                    global_state.total_valid += local_batch_valid; // 這裡不斷累加全域數量
+                    
+                    local_batch_valid = 0;
+                    local_mi1 = 1e30; local_ma1 = -1e30;
+                    local_mi2 = 1e30; local_ma2 = -1e30;
+                    local_mi3 = 1e30; local_ma3 = -1e30;
+                }
+                
+                if (has_local_best) {
+                    if (global_state.has_best) {
+                        global_state.best_score = W1 * norm(global_state.best_result.m1, global_state.mi1, global_state.ma1) + 
+                                                  W2 * norm(global_state.best_result.m2, global_state.mi2, global_state.ma2) + 
+                                                  W3 * norm(global_state.best_result.m3, global_state.mi3, global_state.ma3);
+                    }
+                    double actual_local_score = W1 * norm(local_best.m1, global_state.mi1, global_state.ma1) + 
+                                                W2 * norm(local_best.m2, global_state.mi2, global_state.ma2) + 
+                                                W3 * norm(local_best.m3, global_state.mi3, global_state.ma3);
+                                                
+                    if (!global_state.has_best || actual_local_score < global_state.best_score - 1e-9) {
+                        global_state.best_result = local_best;
+                        global_state.best_score = actual_local_score;
+                        global_state.has_best = true;
+                    } else if (std::abs(actual_local_score - global_state.best_score) <= 1e-9) {
+                        global_state.best_result.best_count += local_best.best_count;
+                    }
+                    has_local_best = false; 
+                }
+                
+                cached_mi1 = global_state.mi1; cached_ma1 = global_state.ma1;
+                cached_mi2 = global_state.mi2; cached_ma2 = global_state.ma2;
+                cached_mi3 = global_state.mi3; cached_ma3 = global_state.ma3;
+            };
 
             for (unsigned long long idx = start_idx; idx < end_idx; ++idx) {
                 if (global_stop_flag.load(std::memory_order_relaxed)) break;
-                
                 local_loop_count++;
-                if (local_loop_count % 100000 == 0) {
-                    global_count.fetch_add(100000, std::memory_order_relaxed);
-                }
-
-                int mask = 0;
-                for (int g : assignment) mask |= (1 << g);
+                
+                int mask = 0; for (int g : assignment) mask |= (1 << g);
                 
                 if (mask == target_mask) {
                     bool is_valid = true;
                     int global_max_dia = 0;
-                    std::vector<DiameterInfo> current_diameters(k);
+                    std::vector<std::pair<int, DiameterInfo>> current_diameters;
 
-                    for (int g_remove = 0; g_remove < k; ++g_remove) {
+                    for (int f_mask : failure_masks) {
                         for(int i = 0; i < num_nodes; ++i) adj[i].clear();
                         for (int i = 0; i < E; ++i) {
-                            if (assignment[i] != g_remove) {
+                            if ((f_mask & (1 << assignment[i])) == 0) {
                                 adj[edges[i].first].push_back(edges[i].second);
                                 adj[edges[i].second].push_back(edges[i].first);
                             }
                         }
 
-                        // 1. 檢查連通性
                         BFSResult check = get_furthest_info(num_nodes, adj, 0);
                         if (check.visited_count < num_nodes) { is_valid = false; break; }
 
-                        // 2. 計算直徑
                         DiameterInfo dia;
                         for (int n = 0; n < num_nodes; ++n) {
                             BFSResult res = get_furthest_info(num_nodes, adj, n);
-                            if (res.dist > dia.dist) {
-                                dia.dist = res.dist;
-                                dia.nodeA = n;
-                                dia.nodeB = res.furthest_node;
-                            }
+                            if (res.dist > dia.dist) { dia.dist = res.dist; dia.nodeA = n; dia.nodeB = res.furthest_node; }
                         }
-                        current_diameters[g_remove] = dia;
+                        current_diameters.push_back({f_mask, dia});
                         global_max_dia = std::max(global_max_dia, dia.dist);
                     }
 
                     if (is_valid) {
-                        local.result.valid_count++;
-                        
-                        std::vector<int> group_counts(k, 0);
-                        for (int g : assignment) group_counts[g]++;
-                        double m1 = 0; double exp = (double)E / k;
-                        for (int c : group_counts) m1 += (c - exp) * (c - exp);
+                        local_batch_valid++;
+                        std::vector<int> group_counts(k, 0); for (int g : assignment) group_counts[g]++;
+                        double m1 = 0; double exp = (double)E / k; for (int c : group_counts) m1 += (c - exp) * (c - exp);
 
-                        double m2 = 0;
-                        std::vector<std::vector<int>> node_dist(num_nodes, std::vector<int>(k, 0));
+                        double m2 = 0; std::vector<std::vector<int>> node_dist(num_nodes, std::vector<int>(k, 0));
                         for (int n = 0; n < num_nodes; ++n) {
-                            for (int i = 0; i < E; ++i) {
-                                if (edges[i].first == n || edges[i].second == n) node_dist[n][assignment[i]]++;
-                            }
+                            for (int i = 0; i < E; ++i) { if (edges[i].first == n || edges[i].second == n) node_dist[n][assignment[i]]++; }
                             double avg = (double)std::accumulate(node_dist[n].begin(), node_dist[n].end(), 0) / k;
                             for (int c : node_dist[n]) m2 += (c - avg) * (c - avg);
                         }
-
                         double m3 = global_max_dia;
 
-                        local.mi1 = std::min(local.mi1, m1); local.ma1 = std::max(local.ma1, m1);
-                        local.mi2 = std::min(local.mi2, m2); local.ma2 = std::max(local.ma2, m2);
-                        local.mi3 = std::min(local.mi3, m3); local.ma3 = std::max(local.ma3, m3);
+                        local_mi1 = std::min(local_mi1, m1); local_ma1 = std::max(local_ma1, m1);
+                        local_mi2 = std::min(local_mi2, m2); local_ma2 = std::max(local_ma2, m2);
+                        local_mi3 = std::min(local_mi3, m3); local_ma3 = std::max(local_ma3, m3);
 
-                        double curr_score = W1 * norm(local.result.m1, local.mi1, local.ma1) + 
-                                            W2 * norm(local.result.m2, local.mi2, local.ma2) + 
-                                            W3 * norm(local.result.m3, local.mi3, local.ma3);
-                        double cand_score = W1 * norm(m1, local.mi1, local.ma1) + 
-                                            W2 * norm(m2, local.mi2, local.ma2) + 
-                                            W3 * norm(m3, local.mi3, local.ma3);
+                        double e_mi1 = std::min(local_mi1, cached_mi1); double e_ma1 = std::max(local_ma1, cached_ma1);
+                        double e_mi2 = std::min(local_mi2, cached_mi2); double e_ma2 = std::max(local_ma2, cached_ma2);
+                        double e_mi3 = std::min(local_mi3, cached_mi3); double e_ma3 = std::max(local_ma3, cached_ma3);
 
-                        if (local.result.valid_count == 1 || cand_score < curr_score - 1e-9) {
-                            local.result.best_assignment = assignment;
-                            local.result.m1 = m1; local.result.m2 = m2; local.result.m3 = m3;
-                            local.result.final_score = cand_score; local.result.best_count = 1;
-                            local.result.group_edge_counts = group_counts;
-                            local.result.node_group_distribution = node_dist;
-                            local.result.group_removal_details = current_diameters;
+                        double cand_score = W1 * norm(m1, e_mi1, e_ma1) + W2 * norm(m2, e_mi2, e_ma2) + W3 * norm(m3, e_mi3, e_ma3);
+                        double curr_score = 1e30;
+                        if (has_local_best) {
+                            curr_score = W1 * norm(local_best.m1, e_mi1, e_ma1) + W2 * norm(local_best.m2, e_mi2, e_ma2) + W3 * norm(local_best.m3, e_mi3, e_ma3);
+                        }
+
+                        if (!has_local_best || cand_score < curr_score - 1e-9) {
+                            local_best.best_assignment = assignment;
+                            local_best.m1 = m1; local_best.m2 = m2; local_best.m3 = m3;
+                            local_best.group_edge_counts = group_counts;
+                            local_best.node_group_distribution = node_dist;
+                            local_best.group_removal_details = current_diameters;
+                            local_best.best_count = 1;
+                            has_local_best = true;
                         } else if (std::abs(cand_score - curr_score) <= 1e-9) {
-                            local.result.best_count++;
+                            local_best.best_count++;
                         }
                     }
                 }
 
-                int i = E - 1;
-                while (i > 0) {
-                    assignment[i]++;
-                    if (assignment[i] < k) break;
-                    assignment[i] = 0;
-                    i--;
+                int i = E - 1; while (i > 0) { assignment[i]++; if (assignment[i] < k) break; assignment[i] = 0; i--; }
+                
+                if (local_loop_count % 100000 == 0) {
+                    global_count.fetch_add(100000, std::memory_order_relaxed);
+                    flush_local_state();
                 }
             }
+            
             global_count.fetch_add(local_loop_count % 100000, std::memory_order_relaxed);
+            flush_local_state();
         });
     }
 
-    // 主執行緒監控與回報
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         unsigned long long current = global_count.load(std::memory_order_relaxed);
         
+        double current_best = -1.0;
+        unsigned long long current_valid = 0; // 【新增】抓取目前的合法總數
+        
         {
-            py::gil_scoped_acquire acquire;
-            if (progress_callback) {
-                // 找出目前所有執行緒中最好的分數
-                double current_best = -1.0;
-                for (const auto& l : thread_results) {
-                    if (l.result.valid_count > 0) {
-                        if (current_best < 0 || l.result.final_score < current_best) {
-                            current_best = l.result.final_score;
-                        }
-                    }
-                }
-                
-                // 把目前的組合數、總組合數，以及最新出爐的「當前最佳評分」回傳給 Python UI
-                if (!progress_callback(current, total_combinations, current_best)) {
-                    global_stop_flag.store(true);
-                }
+            std::lock_guard<std::mutex> lock(global_state.mtx);
+            if (global_state.has_best) {
+                global_state.best_score = W1 * norm(global_state.best_result.m1, global_state.mi1, global_state.ma1) + 
+                                          W2 * norm(global_state.best_result.m2, global_state.mi2, global_state.ma2) + 
+                                          W3 * norm(global_state.best_result.m3, global_state.mi3, global_state.ma3);
+                current_best = global_state.best_score;
+            }
+            current_valid = global_state.total_valid; // 從有鎖定保護的全域變數抓取
+        }
+        
+        py::gil_scoped_acquire acquire;
+        if (progress_callback) {
+            // 【修改】將 current_valid 傳給 Python
+            if (!progress_callback(current, total_combinations, current_best, current_valid)) {
+                global_stop_flag.store(true);
             }
         }
         if (current >= total_combinations || global_stop_flag.load()) break;
@@ -250,55 +294,29 @@ py::dict search_best_assignment(
 
     py::gil_scoped_acquire acquire;
     py::dict py_result;
-    int total_valid = 0;
-    double g_mi1 = 1e30, g_ma1 = -1e30, g_mi2 = 1e30, g_ma2 = -1e30, g_mi3 = 1e30, g_ma3 = -1e30;
-    
-    // 統整全部執行緒的極值
-    for (const auto& l : thread_results) {
-        total_valid += l.result.valid_count;
-        if (l.result.valid_count > 0) {
-            g_mi1 = std::min(g_mi1, l.mi1); g_ma1 = std::max(g_ma1, l.ma1);
-            g_mi2 = std::min(g_mi2, l.mi2); g_ma2 = std::max(g_ma2, l.ma2);
-            g_mi3 = std::min(g_mi3, l.mi3); g_ma3 = std::max(g_ma3, l.ma3);
-        }
-    }
 
-    // 利用全域極值重新計算最終得分
-    if (total_valid > 0) {
-        SearchResult final_best;
-        bool first = true;
-        for (const auto& l : thread_results) {
-            if (l.result.valid_count == 0) continue;
-            double score = W1 * norm(l.result.m1, g_mi1, g_ma1) + 
-                           W2 * norm(l.result.m2, g_mi2, g_ma2) + 
-                           W3 * norm(l.result.m3, g_mi3, g_ma3);
-                           
-            if (first || score < final_best.final_score - 1e-9) {
-                final_best = l.result; 
-                final_best.final_score = score; 
-                first = false;
-            } else if (std::abs(score - final_best.final_score) <= 1e-9) {
-                final_best.best_count += l.result.best_count;
-            }
-        }
+    if (global_state.has_best) {
+        global_state.best_score = W1 * norm(global_state.best_result.m1, global_state.mi1, global_state.ma1) + 
+                                  W2 * norm(global_state.best_result.m2, global_state.mi2, global_state.ma2) + 
+                                  W3 * norm(global_state.best_result.m3, global_state.mi3, global_state.ma3);
 
-        // 打包結果傳回 Python
-        py_result["assignment"] = final_best.best_assignment;
-        py_result["final_score"] = final_best.final_score;
-        py_result["m1"] = final_best.m1; 
-        py_result["m2"] = final_best.m2; 
-        py_result["m3"] = final_best.m3;
-        py_result["valid_count"] = total_valid; 
-        py_result["best_count"] = final_best.best_count;
-        py_result["group_edge_counts"] = final_best.group_edge_counts;
-        py_result["node_group_distribution"] = final_best.node_group_distribution;
+        py_result["assignment"] = global_state.best_result.best_assignment;
+        py_result["final_score"] = global_state.best_score;
+        py_result["m1"] = global_state.best_result.m1; 
+        py_result["m2"] = global_state.best_result.m2; 
+        py_result["m3"] = global_state.best_result.m3;
+        py_result["valid_count"] = global_state.total_valid; 
+        py_result["best_count"] = global_state.best_result.best_count;
+        py_result["group_edge_counts"] = global_state.best_result.group_edge_counts;
+        py_result["node_group_distribution"] = global_state.best_result.node_group_distribution;
         
         py::list removal_list;
-        for (const auto& d : final_best.group_removal_details) {
+        for (const auto& d : global_state.best_result.group_removal_details) {
             py::dict d_dict; 
-            d_dict["dist"] = d.dist; 
-            d_dict["nodeA"] = d.nodeA; 
-            d_dict["nodeB"] = d.nodeB;
+            d_dict["mask"] = d.first; 
+            d_dict["dist"] = d.second.dist; 
+            d_dict["nodeA"] = d.second.nodeA; 
+            d_dict["nodeB"] = d.second.nodeB;
             removal_list.append(d_dict);
         }
         py_result["group_removal_details"] = removal_list;

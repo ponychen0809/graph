@@ -14,20 +14,33 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Python Graph Editor - 最佳平衡容錯分析")
         self.resize(1300, 850)
         self.nodes, self.edges_data, self.node_id_counter, self.worker = [], [], 0, None
+        self.current_assignment = None
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # --- Top Layout (原本的功能按鈕) ---
+        # --- Top Layout ---
         top_layout = QHBoxLayout()
         self.add_node_btn = self.create_btn(top_layout, "新增節點 (+)", self.add_new_node)
+        
+        # 【修改】改為「清空全部」按鈕
+        self.clear_btn = self.create_btn(top_layout, "清空全部", self.clear_all_items, "#e74c3c", "white")
+        
         self.arrange_btn = self.create_btn(top_layout, "自動排列", self.arrange_nodes_circle)
+        
         top_layout.addWidget(QLabel(" 分組(K)"))
         self.k_input = QSpinBox()
         self.k_input.setRange(2, 5); self.k_input.setValue(2); self.k_input.setFixedSize(80, 40)
         self.k_input.valueChanged.connect(self.update_stats_and_k_limit)
         top_layout.addWidget(self.k_input)
+
+        top_layout.addWidget(QLabel(" 容忍斷線(F)"))
+        self.f_input = QSpinBox()
+        self.f_input.setRange(1, 1); self.f_input.setValue(1); self.f_input.setFixedSize(80, 40)
+        self.f_input.valueChanged.connect(self.update_stats_view)
+        top_layout.addWidget(self.f_input)
+
         self.search_btn = self.create_btn(top_layout, "搜尋", self.start_background_search, "#ffd700")
         self.stop_btn = self.create_btn(top_layout, "停止", self.stop_background_search, "#ff4c4c", text_color="white")
         self.edst_btn = self.create_btn(top_layout, "計算不相交生成樹", self.calculate_max_edst, "#2ecc71", text_color="white")
@@ -35,11 +48,12 @@ class MainWindow(QMainWindow):
         self.search_btn.setFixedSize(40, 30)
         self.edst_btn.setFixedSize(100, 30)
         self.stop_btn.setFixedSize(40, 30)
+        self.clear_btn.setFixedSize(80, 30) # 稍微加寬一點
 
         top_layout.addStretch()
         main_layout.addLayout(top_layout)
 
-        # --- Weight Layout (權重設定) ---
+        # --- Weight Layout ---
         weight_layout = QHBoxLayout()
         self.w1_i = self.create_weight(weight_layout, "W1 數量:", 0.3)
         self.w2_i = self.create_weight(weight_layout, "W2 拓樸:", 0.3)
@@ -47,11 +61,11 @@ class MainWindow(QMainWindow):
         weight_layout.addStretch()
         main_layout.addLayout(weight_layout)
 
-        # --- NEW: Visibility Control Layout (新增的隱藏/還原工具列) ---
+        # --- Visibility Control Layout ---
         visibility_layout = QHBoxLayout()
         visibility_layout.addWidget(QLabel("顯示控制: "))
         self.hide_group_input = QSpinBox()
-        self.hide_group_input.setRange(1, 2) # 預設會隨 K 值連動
+        self.hide_group_input.setRange(1, 2)
         self.hide_group_input.setFixedSize(80, 30)
         visibility_layout.addWidget(self.hide_group_input)
         
@@ -80,9 +94,8 @@ class MainWindow(QMainWindow):
         stat_box = QVBoxLayout(); stat_box.addWidget(QLabel("即時統計資訊"))
         self.st_n = QLabel("節點數量: 0"); self.st_e = QLabel("連線數量: 0")
         self.st_t = QLabel("可能分法: 0"); self.st_v = QLabel("合法分法:")
-        self.st_score = QLabel("當前最佳評分: --") # 【新增】即時分數標籤
+        self.st_score = QLabel("當前最佳評分: --") 
         
-        # 將 st_score 加入清單一同設定為大小 11
         for l in [self.st_n, self.st_e, self.st_t, self.st_v, self.st_score]:
             l.setFont(QFont("Arial", 11)); stat_box.addWidget(l)
         self.st_v.setStyleSheet("color: blue; font-weight: bold;")
@@ -105,9 +118,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(); v.addWidget(QLabel(title))
         t = QTextEdit(); t.setReadOnly(True); t.setMinimumHeight(180)
         if mono: t.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
-        else:
-            # System Log 使用的字型
-            t.setFont(QFont("Segoe UI", 10))
+        else: t.setFont(QFont("Segoe UI", 10))
         v.addWidget(t); layout.addLayout(v, stretch)
         return t
 
@@ -115,9 +126,9 @@ class MainWindow(QMainWindow):
         self.log_te.append(msg); self.log_te.verticalScrollBar().setValue(self.log_te.verticalScrollBar().maximum())
 
     def update_stats_and_k_limit(self):
-        """當 K 值改變時，同時更新統計與隱藏按鈕的上限"""
         k_val = self.k_input.value()
         self.hide_group_input.setRange(1, k_val)
+        self.f_input.setRange(1, max(1, k_val - 1)) 
         self.update_stats_view()
 
     def add_new_node(self):
@@ -142,9 +153,7 @@ class MainWindow(QMainWindow):
 
     def update_matrix_view(self):
         n = len(self.nodes)
-        if n == 0:
-            # self.matrix_te.setText("等待節點...")
-            return
+        if n == 0: return
         id_m = {nd.node_id: i for i, nd in enumerate(self.nodes)}
         mt = [[0]*n for _ in range(n)]
         for u, v, _ in self.edges_data:
@@ -159,45 +168,50 @@ class MainWindow(QMainWindow):
         self.st_n.setText(f"節點數量: {len(self.nodes)}")
         self.st_e.setText(f"連線數量: {e}")
         self.st_t.setText(f"可能分法: {k**e if e > 0 else 0:,}")
-        self.st_v.setText("合法分法:"); self.st_v.setStyleSheet("color: blue; font-weight: bold;")
+        self.st_v.setText("合法分法:")
+        self.st_v.setStyleSheet("color: blue; font-weight: bold;")
         self.st_score.setText("當前最佳評分: --"); self.st_score.setStyleSheet("color: black;")
 
     def start_background_search(self):
         if not self.edges_data: return
-        # 搜尋前還原所有邊的屬性
         for _, _, l in self.edges_data: 
             l.setPen(QPen(Qt.GlobalColor.red, 2))
             l.setVisible(True)
             if hasattr(l, 'group_id'): del l.group_id
 
         self.set_ui_enabled(False); self.p_bar.setVisible(True); self.p_bar.setValue(0)
+        self.st_v.setText("合法分法: 0")
+        self.st_v.setStyleSheet("color: black; font-weight: bold;")
         self.st_score.setText("當前最佳評分: 計算中...")
+        
         w_raw = (self.w1_i.value(), self.w2_i.value(), self.w3_i.value())
         total_w = sum(w_raw)
         weights = (0.33, 0.33, 0.33) if total_w == 0 else [w/total_w for w in w_raw]
         
-        self.worker = SearchWorker(self.k_input.value(), self.edges_data, self.nodes, weights)
+        self.worker = SearchWorker(self.k_input.value(), self.f_input.value(), self.edges_data, self.nodes, weights)
         self.worker.progress_updated.connect(lambda p, t: (self.p_bar.setValue(p), self.p_bar.setFormat(t)))
         self.worker.log_msg.connect(self.log_message)
         self.worker.search_finished.connect(self.on_search_finished)
-        
-        # 【新增】連動 Worker 發出的 score_updated 訊號，即時更新介面
         self.worker.score_updated.connect(self.update_live_score)
+        self.worker.valid_updated.connect(self.update_live_valid)
         self.worker.start()
 
     def update_live_score(self, score):
-        """【新增】搜尋期間即時更新分數標籤的函式"""
         if score >= 0:
             self.st_score.setText(f"當前最佳評分: {score:.6f}")
             self.st_score.setStyleSheet("color: #d35400; font-weight: bold;")
+
+    def update_live_valid(self, valid_count):
+        self.st_v.setText(f"合法分法: {valid_count:,}")
+        self.st_v.setStyleSheet(f"color: {'green' if valid_count > 0 else 'black'}; font-weight: bold;")
 
     def stop_background_search(self):
         if self.worker: self.worker.stop(); self.stop_btn.setEnabled(False)
 
     def set_ui_enabled(self, e):
-        # 搜尋時禁用顯示控制按鈕
-        for w in [self.add_node_btn, self.arrange_btn, self.search_btn, self.edst_btn, 
-                  self.k_input, self.w1_i, self.w2_i, self.w3_i, self.view, self.hide_btn, self.show_all_btn]:
+        # 【修改】禁用清單包含 clear_btn
+        for w in [self.add_node_btn, self.clear_btn, self.arrange_btn, self.search_btn, self.edst_btn, 
+                  self.k_input, self.f_input, self.w1_i, self.w2_i, self.w3_i, self.view, self.hide_btn, self.show_all_btn]:
             w.setEnabled(e)
         self.stop_btn.setEnabled(not e)
 
@@ -206,127 +220,139 @@ class MainWindow(QMainWindow):
         self.set_ui_enabled(True)
         self.st_v.setText(f"合法分法: {valid:,}")
         self.st_v.setStyleSheet(f"color: {'green' if valid > 0 else 'red'}; font-weight: bold;")
-        self.log_message(f"--- 搜尋結束 (耗時 {elapsed:.2f}s) ---")
+        self.log_message(f"--------- 搜尋結束 (耗時 {elapsed:.2f}s) ---------")
         
         if valid > 0 and best:
             self.current_assignment = best["assignment"]
-            
             score = best.get("final_score", 0.0)
-            m1 = best.get("m1", 0.0) 
-            m2 = best.get("m2", 0.0) 
-            m3 = best.get("m3", 0.0) 
-            
-            # 【新增】搜尋完成後，最後更新一次分數
+            m1 = best.get("m1", 0.0); m2 = best.get("m2", 0.0); m3 = best.get("m3", 0.0) 
             self.st_score.setText(f"當前最佳評分: {score:.6f}")
             self.st_score.setStyleSheet("color: #d35400; font-weight: bold;")
-
-            self.log_message(f"[結果] 發現 {valid:,} 種合法解 | 同分最佳解 {b_count:,} 種")
-            self.log_message(f"[最佳評分] {score:.6f}")
-
-            self.log_message(f" ├ 指標 M1 (數量方差): {m1:.2f}")
-            self.log_message(f" ├ 指標 M2 (拓樸方差): {m2:.2f}")
-            self.log_message(f" ├ 指標 M3 (最大直徑): {m3}")
-            
-            group_counts = best.get("group_edge_counts", [])
-            counts_str = ", ".join([f"Group {i}: {c} 邊" for i, c in enumerate(group_counts)])
-            self.log_message(f" ├ M1 邊數分佈: {counts_str}")
-            
-            node_dist = best.get("node_group_distribution", [])
-            self.log_message(f" ├ M2 節點連線詳情 [G0, G1, ...]:")
-            for node_idx, dist in enumerate(node_dist):
-                node_id = self.nodes[node_idx].node_id
-                dist_str = ", ".join(map(str, dist))
-                
-                self.log_message(f" │  └ Node {node_id}: [{dist_str}]")
-
-            removal_details = best.get("group_removal_details", [])
-            self.log_message(f" └ M3 斷線容錯分析 (各組移除後):")
-            for i, detail in enumerate(removal_details):
-                nA_id = self.nodes[detail['nodeA']].node_id if detail['nodeA'] != -1 else "?"
-                nB_id = self.nodes[detail['nodeB']].node_id if detail['nodeB'] != -1 else "?"
-                dist = detail['dist']
-                self.log_message(f"    └ 移除 Group {i}: 直徑 {dist} | 最遠路徑 ({nA_id} ↔ {nB_id})")
-            
             palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, 
                        Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan]
             for i, group in enumerate(best["assignment"]): 
                 link_item = self.edges_data[i][2]
                 link_item.setPen(QPen(palette[group % len(palette)], 3))
                 link_item.group_id = group
-                
 
-    # --- NEW: Visibility Logic ---
     def hide_selected_group(self):
-        target = self.hide_group_input.value() - 1 # UI 是 1-based, 程式是 0-based
+        target = self.hide_group_input.value() - 1 
         count = 0
         for _, _, link in self.edges_data:
             if hasattr(link, 'group_id') and link.group_id == target:
-                link.setVisible(False)
-                count += 1
-        
-        if count > 0:
-            self.log_message(f"[UI] 已暫時隱藏第 {target+1} 組的邊 (共 {count} 條)")
-        else:
-            self.log_message(f"[警告] 找不到第 {target+1} 組的分組資訊，請先執行搜尋。")
+                link.setVisible(False); count += 1
+        if count > 0: self.log_message(f"[UI] 已暫時隱藏第 {target+1} 組的邊 (共 {count} 條)")
+        else: self.log_message(f"[警告] 找不到第 {target+1} 組的分組資訊，請先執行搜尋。")
 
     def show_all_edges(self):
-        for _, _, link in self.edges_data:
-            link.setVisible(True)
+        for _, _, link in self.edges_data: link.setVisible(True)
 
     def calculate_max_edst(self):
         if len(self.nodes) < 2:
             self.log_message("[EDST] 節點不足，無法分析。")
             return
-        
         for _, _, l in self.edges_data: l.setVisible(True)
-
-        V = [n.node_id for n in self.nodes]
+        V_ids = [n.node_id for n in self.nodes]
         E_with_links = [(u.node_id, v.node_id, l) for u, v, l in self.edges_data]
-
-        def get_parent(parent, i):
-            if parent[i] == i: return i
-            parent[i] = get_parent(parent, parent[i])
-            return parent[i]
-
-        def is_circuit_free(edges_subset, vertices):
-            parent = {n: n for n in vertices}
-            for u, v, _ in edges_subset:
-                root_u, root_v = get_parent(parent, u), get_parent(parent, v)
-                if root_u == root_v: return False
-                parent[root_u] = root_v
-            return True
-
-        max_k = 0
-        best_forests = []
-        theoretical_limit = len(E_with_links) // (len(V) - 1)
-
+        def get_path_in_forest(forest_edges, u, v):
+            adj = {vid: [] for vid in V_ids}
+            for e in forest_edges:
+                adj[e[0]].append((e[1], e)); adj[e[1]].append((e[0], e))
+            visited = {u}; queue = [(u, [])]; head = 0
+            while head < len(queue):
+                curr, path = queue[head]; head += 1
+                if curr == v: return path
+                for neighbor, edge in adj[curr]:
+                    if neighbor not in visited:
+                        visited.add(neighbor); queue.append((neighbor, path + [edge]))
+            return []
+        max_k = 0; best_forests = []; theoretical_limit = len(E_with_links) // (len(V_ids) - 1)
         for k in range(1, theoretical_limit + 1):
-            current_forests = [[] for _ in range(k)]
-            for e_tuple in E_with_links:
-                for f_idx in range(k):
-                    if is_circuit_free(current_forests[f_idx] + [e_tuple], V):
-                        current_forests[f_idx].append(e_tuple)
-                        break
-            
-            full_trees = [f for f in current_forests if len(f) == len(V) - 1]
-            if len(full_trees) >= k:
-                max_k = k
-                best_forests = full_trees
-            else:
-                break
-
-        for _, _, l in self.edges_data:
-            l.setPen(QPen(Qt.GlobalColor.lightGray, 1, Qt.PenStyle.DashLine))
-
+            forests = [[] for _ in range(k)]
+            for e_new in E_with_links:
+                added_greedily = False
+                for i in range(k):
+                    if not get_path_in_forest(forests[i], e_new[0], e_new[1]):
+                        forests[i].append(e_new); added_greedily = True; break
+                if added_greedily: continue
+                queue = [e_new]; parent = {e_new: None}; target_edge = None; target_forest = None; head = 0
+                while head < len(queue) and target_edge is None:
+                    curr_e = queue[head]; head += 1
+                    for i in range(k):
+                        path = get_path_in_forest(forests[i], curr_e[0], curr_e[1])
+                        if not path: target_edge = curr_e; target_forest = i; break
+                        else:
+                            for cycle_e in path:
+                                if cycle_e not in parent: parent[cycle_e] = (curr_e, i); queue.append(cycle_e)
+                if target_edge is not None:
+                    curr = target_edge; forests[target_forest].append(curr)
+                    while parent[curr] is not None:
+                        prev_e, f_idx = parent[curr]
+                        forests[f_idx].remove(curr); forests[f_idx].append(prev_e); curr = prev_e
+            full_trees = [f for f in forests if len(f) == len(V_ids) - 1]
+            if len(full_trees) == k: max_k = k; best_forests = full_trees
+            else: break
+        for _, _, l in self.edges_data: l.setPen(QPen(Qt.GlobalColor.lightGray, 1, Qt.PenStyle.DashLine))
         self.log_message(f"--- 最大不相交生成樹分析 ---")
-        self.log_message(f"此圖包含 {max_k} 棵邊不相交生成樹。")
-        
         if max_k > 0:
-            palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, 
-                       Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan, Qt.GlobalColor.darkRed]
+            palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan, Qt.GlobalColor.darkRed]
             for tree_idx, tree_edges in enumerate(best_forests):
                 color = palette[tree_idx % len(palette)]
-                for _, _, link_obj in tree_edges:
-                    link_obj.setPen(QPen(color, 3))
+                for _, _, l in tree_edges: l.setPen(QPen(color, 3))
+
+    # ==========================================
+    # 刪除功能與鍵盤監聽事件區塊
+    # ==========================================
+    def clear_all_items(self):
+        """【新增】一鍵清空畫布上所有的節點與連線"""
+        if not self.nodes and not self.edges_data:
+            return
+            
+        self.scene.clear()
+        self.nodes = []
+        self.edges_data = []
+        self.node_id_counter = 0 # 重置計數器
+        self.current_assignment = None
+        
+        # self.log_message("[UI] 已清空所有節點與連線。")
+        self.update_matrix_view()
+        self.update_stats_view()
+
+    def delete_selected_items(self):
+        """處理刪除選取物件的邏輯（鍵盤 Del 鍵觸發）"""
+        selected_items = self.scene.selectedItems()
+        if not selected_items:
+            return
+
+        nodes_to_delete = []
+        links_to_delete = []
+
+        for item in selected_items:
+            if isinstance(item, Node): nodes_to_delete.append(item)
+            elif isinstance(item, Link): links_to_delete.append(item)
+
+        edges_to_remove = []
+        for u, v, link in self.edges_data:
+            if link in links_to_delete or u in nodes_to_delete or v in nodes_to_delete:
+                edges_to_remove.append((u, v, link))
+
+        for u, v, link in edges_to_remove:
+            if (u, v, link) in self.edges_data: self.edges_data.remove((u, v, link))
+            if link in self.scene.items(): self.scene.removeItem(link)
+            u.remove_link(link); v.remove_link(link)
+
+        for node in nodes_to_delete:
+            if node in self.nodes: self.nodes.remove(node)
+            if node in self.scene.items(): self.scene.removeItem(node)
+
+        if nodes_to_delete or edges_to_remove:
+            # self.log_message(f"[UI] 已刪除選取的 {len(nodes_to_delete)} 個節點 與 {len(edges_to_remove)} 條連線。")
+            self.update_matrix_view()
+            self.update_stats_view()
+
+    def keyPressEvent(self, event):
+        """監聽鍵盤 Delete 或 Backspace 鍵"""
+        if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
+            self.delete_selected_items()
         else:
-            self.log_message(f"警告：連一棵完整的生成樹都找不出來。")
+            super().keyPressEvent(event)
