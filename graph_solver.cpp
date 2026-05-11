@@ -9,6 +9,7 @@
 #include <thread>
 #include <atomic>
 #include <numeric>
+
 namespace py = pybind11;
 
 // 儲存斷線後的直徑資訊
@@ -26,9 +27,9 @@ struct SearchResult {
     double m1 = 0, m2 = 0, m3 = 0, final_score = 0;
 
     // --- 新增詳細統計欄位 ---
-    std::vector<int> group_edge_counts; // 每一組有多少邊
-    std::vector<std::vector<int>> node_group_distribution; // 每個 node 在各組的邊數 [node_idx][group_idx]
-    std::vector<DiameterInfo> group_removal_details; // 斷開每一組後的直徑詳情
+    std::vector<int> group_edge_counts;
+    std::vector<std::vector<int>> node_group_distribution;
+    std::vector<DiameterInfo> group_removal_details;
 };
 
 struct ThreadLocalBounds {
@@ -38,7 +39,6 @@ struct ThreadLocalBounds {
     SearchResult result;
 };
 
-// 修改 BFS，回傳距離最遠的節點 ID
 struct BFSResult {
     int dist;
     int furthest_node;
@@ -55,7 +55,8 @@ BFSResult get_furthest_info(int num_nodes, const std::vector<std::vector<int>>& 
     int furthest = start_node;
 
     while(!q.empty()) {
-        int u = q.front(); q.pop();
+        int u = q.front();
+        q.pop();
         if (dists[u] > max_d) {
             max_d = dists[u];
             furthest = u;
@@ -87,7 +88,7 @@ py::dict search_best_assignment(
     int k, int num_nodes, 
     std::vector<std::pair<int, int>> edges, 
     std::vector<double> weights,
-    std::function<bool(unsigned long long, unsigned long long)> progress_callback
+    std::function<bool(unsigned long long, unsigned long long, double)> progress_callback // 增加 double 參數用來回傳分數
 ) {
     int E = edges.size();
     if (E == 0 || num_nodes == 0) return py::dict();
@@ -121,8 +122,11 @@ py::dict search_best_assignment(
 
             for (unsigned long long idx = start_idx; idx < end_idx; ++idx) {
                 if (global_stop_flag.load(std::memory_order_relaxed)) break;
+                
                 local_loop_count++;
-                if (local_loop_count % 100000 == 0) global_count.fetch_add(100000, std::memory_order_relaxed);
+                if (local_loop_count % 100000 == 0) {
+                    global_count.fetch_add(100000, std::memory_order_relaxed);
+                }
 
                 int mask = 0;
                 for (int g : assignment) mask |= (1 << g);
@@ -162,13 +166,11 @@ py::dict search_best_assignment(
                     if (is_valid) {
                         local.result.valid_count++;
                         
-                        // 計算 M1
                         std::vector<int> group_counts(k, 0);
                         for (int g : assignment) group_counts[g]++;
                         double m1 = 0; double exp = (double)E / k;
                         for (int c : group_counts) m1 += (c - exp) * (c - exp);
 
-                        // 計算 M2
                         double m2 = 0;
                         std::vector<std::vector<int>> node_dist(num_nodes, std::vector<int>(k, 0));
                         for (int n = 0; n < num_nodes; ++n) {
@@ -217,12 +219,29 @@ py::dict search_best_assignment(
         });
     }
 
+    // 主執行緒監控與回報
     while (true) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         unsigned long long current = global_count.load(std::memory_order_relaxed);
+        
         {
             py::gil_scoped_acquire acquire;
-            if (progress_callback && !progress_callback(current, total_combinations)) global_stop_flag.store(true);
+            if (progress_callback) {
+                // 找出目前所有執行緒中最好的分數
+                double current_best = -1.0;
+                for (const auto& l : thread_results) {
+                    if (l.result.valid_count > 0) {
+                        if (current_best < 0 || l.result.final_score < current_best) {
+                            current_best = l.result.final_score;
+                        }
+                    }
+                }
+                
+                // 把目前的組合數、總組合數，以及最新出爐的「當前最佳評分」回傳給 Python UI
+                if (!progress_callback(current, total_combinations, current_best)) {
+                    global_stop_flag.store(true);
+                }
+            }
         }
         if (current >= total_combinations || global_stop_flag.load()) break;
     }
@@ -232,10 +251,9 @@ py::dict search_best_assignment(
     py::gil_scoped_acquire acquire;
     py::dict py_result;
     int total_valid = 0;
-    double g_mi1 = std::numeric_limits<double>::max(), g_ma1 = std::numeric_limits<double>::lowest();
-    double g_mi2 = std::numeric_limits<double>::max(), g_ma2 = std::numeric_limits<double>::lowest();
-    double g_mi3 = std::numeric_limits<double>::max(), g_ma3 = std::numeric_limits<double>::lowest();
-
+    double g_mi1 = 1e30, g_ma1 = -1e30, g_mi2 = 1e30, g_ma2 = -1e30, g_mi3 = 1e30, g_ma3 = -1e30;
+    
+    // 統整全部執行緒的極值
     for (const auto& l : thread_results) {
         total_valid += l.result.valid_count;
         if (l.result.valid_count > 0) {
@@ -245,28 +263,42 @@ py::dict search_best_assignment(
         }
     }
 
+    // 利用全域極值重新計算最終得分
     if (total_valid > 0) {
-        SearchResult final_best; bool first = true;
+        SearchResult final_best;
+        bool first = true;
         for (const auto& l : thread_results) {
             if (l.result.valid_count == 0) continue;
-            double score = W1 * norm(l.result.m1, g_mi1, g_ma1) + W2 * norm(l.result.m2, g_mi2, g_ma2) + W3 * norm(l.result.m3, g_mi3, g_ma3);
+            double score = W1 * norm(l.result.m1, g_mi1, g_ma1) + 
+                           W2 * norm(l.result.m2, g_mi2, g_ma2) + 
+                           W3 * norm(l.result.m3, g_mi3, g_ma3);
+                           
             if (first || score < final_best.final_score - 1e-9) {
-                final_best = l.result; final_best.final_score = score; first = false;
+                final_best = l.result; 
+                final_best.final_score = score; 
+                first = false;
             } else if (std::abs(score - final_best.final_score) <= 1e-9) {
                 final_best.best_count += l.result.best_count;
             }
         }
 
+        // 打包結果傳回 Python
         py_result["assignment"] = final_best.best_assignment;
         py_result["final_score"] = final_best.final_score;
-        py_result["m1"] = final_best.m1; py_result["m2"] = final_best.m2; py_result["m3"] = final_best.m3;
-        py_result["valid_count"] = total_valid; py_result["best_count"] = final_best.best_count;
+        py_result["m1"] = final_best.m1; 
+        py_result["m2"] = final_best.m2; 
+        py_result["m3"] = final_best.m3;
+        py_result["valid_count"] = total_valid; 
+        py_result["best_count"] = final_best.best_count;
         py_result["group_edge_counts"] = final_best.group_edge_counts;
         py_result["node_group_distribution"] = final_best.node_group_distribution;
-
+        
         py::list removal_list;
         for (const auto& d : final_best.group_removal_details) {
-            py::dict d_dict; d_dict["dist"] = d.dist; d_dict["nodeA"] = d.nodeA; d_dict["nodeB"] = d.nodeB;
+            py::dict d_dict; 
+            d_dict["dist"] = d.dist; 
+            d_dict["nodeA"] = d.nodeA; 
+            d_dict["nodeB"] = d.nodeB;
             removal_list.append(d_dict);
         }
         py_result["group_removal_details"] = removal_list;

@@ -80,7 +80,10 @@ class MainWindow(QMainWindow):
         stat_box = QVBoxLayout(); stat_box.addWidget(QLabel("即時統計資訊"))
         self.st_n = QLabel("節點數量: 0"); self.st_e = QLabel("連線數量: 0")
         self.st_t = QLabel("可能分法: 0"); self.st_v = QLabel("合法分法:")
-        for l in [self.st_n, self.st_e, self.st_t, self.st_v]:
+        self.st_score = QLabel("當前最佳評分: --") # 【新增】即時分數標籤
+        
+        # 將 st_score 加入清單一同設定為大小 11
+        for l in [self.st_n, self.st_e, self.st_t, self.st_v, self.st_score]:
             l.setFont(QFont("Arial", 11)); stat_box.addWidget(l)
         self.st_v.setStyleSheet("color: blue; font-weight: bold;")
         stat_box.addStretch(); info_layout.addLayout(stat_box, 1)
@@ -157,6 +160,7 @@ class MainWindow(QMainWindow):
         self.st_e.setText(f"連線數量: {e}")
         self.st_t.setText(f"可能分法: {k**e if e > 0 else 0:,}")
         self.st_v.setText("合法分法:"); self.st_v.setStyleSheet("color: blue; font-weight: bold;")
+        self.st_score.setText("當前最佳評分: --"); self.st_score.setStyleSheet("color: black;")
 
     def start_background_search(self):
         if not self.edges_data: return
@@ -167,13 +171,25 @@ class MainWindow(QMainWindow):
             if hasattr(l, 'group_id'): del l.group_id
 
         self.set_ui_enabled(False); self.p_bar.setVisible(True); self.p_bar.setValue(0)
+        self.st_score.setText("當前最佳評分: 計算中...")
         w_raw = (self.w1_i.value(), self.w2_i.value(), self.w3_i.value())
         total_w = sum(w_raw)
         weights = (0.33, 0.33, 0.33) if total_w == 0 else [w/total_w for w in w_raw]
+        
         self.worker = SearchWorker(self.k_input.value(), self.edges_data, self.nodes, weights)
         self.worker.progress_updated.connect(lambda p, t: (self.p_bar.setValue(p), self.p_bar.setFormat(t)))
         self.worker.log_msg.connect(self.log_message)
-        self.worker.search_finished.connect(self.on_search_finished); self.worker.start()
+        self.worker.search_finished.connect(self.on_search_finished)
+        
+        # 【新增】連動 Worker 發出的 score_updated 訊號，即時更新介面
+        self.worker.score_updated.connect(self.update_live_score)
+        self.worker.start()
+
+    def update_live_score(self, score):
+        """【新增】搜尋期間即時更新分數標籤的函式"""
+        if score >= 0:
+            self.st_score.setText(f"當前最佳評分: {score:.6f}")
+            self.st_score.setStyleSheet("color: #d35400; font-weight: bold;")
 
     def stop_background_search(self):
         if self.worker: self.worker.stop(); self.stop_btn.setEnabled(False)
@@ -193,51 +209,49 @@ class MainWindow(QMainWindow):
         self.log_message(f"--- 搜尋結束 (耗時 {elapsed:.2f}s) ---")
         
         if valid > 0 and best:
-            # 【新增】將最佳分組結果存入變數，供隱藏/還原功能使用
             self.current_assignment = best["assignment"]
+            
             score = best.get("final_score", 0.0)
-            m1 = best.get("m1", 0.0) # 新增抓取 m1
-            m2 = best.get("m2", 0.0) # 新增抓取 m2
-            m3 = best.get("m3", 0.0) # 新增抓取 m3
-            # 1. 輸出基本評分
-            score = best.get("final_score", 0.0)
+            m1 = best.get("m1", 0.0) 
+            m2 = best.get("m2", 0.0) 
+            m3 = best.get("m3", 0.0) 
+            
+            # 【新增】搜尋完成後，最後更新一次分數
+            self.st_score.setText(f"當前最佳評分: {score:.6f}")
+            self.st_score.setStyleSheet("color: #d35400; font-weight: bold;")
+
             self.log_message(f"[結果] 發現 {valid:,} 種合法解 | 同分最佳解 {b_count:,} 種")
             self.log_message(f"[最佳評分] {score:.6f}")
 
             self.log_message(f" ├ 指標 M1 (數量方差): {m1:.2f}")
             self.log_message(f" ├ 指標 M2 (拓樸方差): {m2:.2f}")
             self.log_message(f" ├ 指標 M3 (最大直徑): {m3}")
-            # 2. 輸出各組邊數 (M1 詳細資料)
+            
             group_counts = best.get("group_edge_counts", [])
             counts_str = ", ".join([f"Group {i}: {c} 邊" for i, c in enumerate(group_counts)])
             self.log_message(f" ├ M1 邊數分佈: {counts_str}")
             
-            # 3. 輸出每個節點在各組的連線數 (M2 詳細資料)
             node_dist = best.get("node_group_distribution", [])
             self.log_message(f" ├ M2 節點連線詳情 [G0, G1, ...]:")
             for node_idx, dist in enumerate(node_dist):
                 node_id = self.nodes[node_idx].node_id
                 dist_str = ", ".join(map(str, dist))
-                print(dist)
+                
                 self.log_message(f" │  └ Node {node_id}: [{dist_str}]")
 
-            # 4. 輸出斷線後的直徑與最遠兩點 (M3 詳細資料)
             removal_details = best.get("group_removal_details", [])
             self.log_message(f" └ M3 斷線容錯分析 (各組移除後):")
             for i, detail in enumerate(removal_details):
-                # 因為 C++ 回傳的是 index，我們要對應回介面的 node_id
                 nA_id = self.nodes[detail['nodeA']].node_id if detail['nodeA'] != -1 else "?"
                 nB_id = self.nodes[detail['nodeB']].node_id if detail['nodeB'] != -1 else "?"
                 dist = detail['dist']
                 self.log_message(f"    └ 移除 Group {i}: 直徑 {dist} | 最遠路徑 ({nA_id} ↔ {nB_id})")
             
-            # 5. 著色並標記 Group ID
             palette = [Qt.GlobalColor.blue, Qt.GlobalColor.green, Qt.GlobalColor.magenta, 
                        Qt.GlobalColor.darkYellow, Qt.GlobalColor.cyan]
             for i, group in enumerate(best["assignment"]): 
                 link_item = self.edges_data[i][2]
                 link_item.setPen(QPen(palette[group % len(palette)], 3))
-                # 【新增】將分組 ID 貼在 Link 物件上，隱藏按鈕才找得到它
                 link_item.group_id = group
                 
 
@@ -258,10 +272,8 @@ class MainWindow(QMainWindow):
     def show_all_edges(self):
         for _, _, link in self.edges_data:
             link.setVisible(True)
-        # self.log_message("[UI] 已還原所有邊的顯示。")
 
     def calculate_max_edst(self):
-        # 原本的 EDST 邏輯不變，但同樣加入還原所有顯示的動作
         if len(self.nodes) < 2:
             self.log_message("[EDST] 節點不足，無法分析。")
             return

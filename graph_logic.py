@@ -1,11 +1,13 @@
 import time
 from PySide6.QtCore import QThread, Signal
-import graph_cpp_core # 引入我們剛剛編譯好的 C++ 模組
+import graph_cpp_core
 
 class SearchWorker(QThread):
-    progress_updated = Signal(int, str) 
-    log_msg = Signal(str)               
-    search_finished = Signal(object, int, int, float) 
+    # 定義與 UI 溝通的訊號
+    progress_updated = Signal(int, str)               # 更新進度條與文字 (百分比, 提示字串)
+    score_updated = Signal(float)                     # 即時更新當前最佳分數 (新增)
+    log_msg = Signal(str)                             # 傳送系統日誌
+    search_finished = Signal(object, int, int, float) # 搜尋結束 (最佳解, 合法數量, 同分數數量, 耗時)
 
     def __init__(self, k, edges_data, nodes, weights):
         super().__init__()
@@ -16,35 +18,41 @@ class SearchWorker(QThread):
         self._is_running = True 
 
     def stop(self):
+        """外部呼叫此方法來中斷搜尋"""
         self._is_running = False
-        # 注意：因為目前運算完全交由 C++ 底層執行，一旦進入 C++ 函式後，
-        # 在它算完之前 Python 無法中斷它。如果圖非常大，按下停止可能不會立刻反應。
 
     def format_time(self, seconds):
-        if seconds < 60: return f"{int(seconds)}s"
-        if seconds < 3600: return f"{int(seconds//60)}m {int(seconds%60)}s"
-        return f"{int(seconds//3600)}h {int((seconds%3600)//60)}m"
+        """將秒數格式化為易讀的字串"""
+        if seconds < 60: 
+            return f"{int(seconds)}s"
+        if seconds < 3600: 
+            return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+        return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
 
     def run(self):
-        import graph_cpp_core # 引入我們編譯好的 C++ 模組
-        
         E_count = len(self.edges_data)
         if E_count == 0:
             self.search_finished.emit(None, 0, 0, 0.0)
             return
 
-        reduced_total = self.k ** (E_count - 1)
-        self.log_msg.emit(f"開始搜尋 (需檢查 {reduced_total:,} 種組合)")
+        # 第 0 條邊固定為第 0 組 (對稱優化)
+        reduced_total = self.k ** max(0, E_count - 1)
+        self.log_msg.emit(f"啟動 C++ 加速引擎... (需檢查 {reduced_total:,} 種組合)")
         
         start_time = time.time()
         last_update_time = start_time
 
-        # --- 【新增】準備傳給 C++ 的回呼函式 ---
-        def cpp_progress_callback(current_count, total_count):
+        def cpp_progress_callback(current_count, total_count, current_best_score):
+            """這個函式會由 C++ 引擎頻繁呼叫，用來回報進度與當前最佳分數"""
             nonlocal last_update_time
             now = time.time()
             
-            # 控制更新頻率 (每 0.2 秒最多更新一次介面，避免 GUI 刷新太快卡頓)
+            # 若 C++ 有找到合法解，即時發送分數更新 UI
+            if current_best_score >= 0:
+                # print(current_best_score)
+                self.score_updated.emit(current_best_score)
+
+            # 為了避免 UI 卡頓，限制每 0.2 秒更新一次介面
             if now - last_update_time >= 0.2:
                 elapsed = now - start_time
                 pct = int((current_count / total_count) * 100) if total_count > 0 else 0
@@ -55,28 +63,32 @@ class SearchWorker(QThread):
                 self.progress_updated.emit(pct, text)
                 last_update_time = now
                 
-            # 回傳 True 代表繼續執行，回傳 False 代表中斷 (使用者按了停止)
-            return self._is_running
+            # 回傳 False 就會通知 C++ 停止計算
+            return self._is_running 
 
-        # 1. 安全映射：將 node 對應為 0 ~ (num_nodes - 1) 的 index
+        # 將介面的 Node 轉換為純數字 ID 交給 C++
         id_map = {node: idx for idx, node in enumerate(self.nodes)}
         edges_list = [(id_map[u], id_map[v]) for u, v, _ in self.edges_data]
         weights_list = list(self.weights)
 
-        # 2. 直接呼叫 C++ 核心，並把 callback 傳進去
+        # 呼叫 C++ 核心執行搜尋
         result_dict = graph_cpp_core.search_best_assignment(
-            self.k, len(self.nodes), edges_list, weights_list, cpp_progress_callback
+            self.k, 
+            len(self.nodes), 
+            edges_list, 
+            weights_list, 
+            cpp_progress_callback
         )
 
         final_elapsed = time.time() - start_time
         
-        # 根據是否是被手動停止，顯示不同訊息
+        # 判斷是自然結束還是被使用者中斷
         if not self._is_running:
             self.progress_updated.emit(100, f"已中斷搜尋 | 總耗時: {self.format_time(final_elapsed)}")
         else:
             self.progress_updated.emit(100, f"C++ 搜尋結束 | 總耗時: {self.format_time(final_elapsed)}")
 
-        # 3. 處理回傳結果
+        # 回傳最終結果給 UI
         if not result_dict:
             self.search_finished.emit(None, 0, 0, final_elapsed)
         else:
